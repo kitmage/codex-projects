@@ -8,6 +8,7 @@ This extension plugin enforces private file handling for Fluent Forms:
 3. Replaces admin Entry Details file links with signed, protected download URLs.
 4. Serves file downloads only to logged-in users with `manage_options` capability.
 5. Supports single and multiple file uploads.
+6. Includes multiple enforcement layers: `upload_dir`, `fluentform/insert_response_data`, `fluentform/filter_insert_data`, and a post-insert reconciliation hook for robust relocation.
 
 ## Install
 

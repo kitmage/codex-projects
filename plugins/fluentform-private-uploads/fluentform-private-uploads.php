@@ -39,12 +39,59 @@ final class FF_Private_Uploads_Extension
 
     public function registerHooks()
     {
+        add_filter('fluentform/insert_response_data', [$this, 'prepareFormDataFiles'], 99, 3);
         add_filter('fluentform/filter_insert_data', [$this, 'storeFilesPrivately'], 99, 1);
         add_filter('fluentform/response_render_input_file', [$this, 'renderProtectedFileLinks'], 20, 4);
 
         add_action('admin_post_' . self::DOWNLOAD_ACTION, [$this, 'servePrivateFile']);
         add_action('admin_post_nopriv_' . self::DOWNLOAD_ACTION, [$this, 'denyGuestDownload']);
         add_filter('upload_dir', [$this, 'forcePrivateUploadDirForFluentForms'], 20, 1);
+        add_action('fluentform/submission_inserted', [$this, 'reconcileSubmissionFiles'], 20, 3);
+    }
+
+
+    public function prepareFormDataFiles($formData, $formId, $inputConfigs)
+    {
+        if (!is_array($formData)) {
+            return $formData;
+        }
+
+        return $this->mapFileValues($formData, function ($value) {
+            return $this->relocateToPrivateAndMark($value);
+        });
+    }
+
+    public function reconcileSubmissionFiles($insertId, $formData, $form)
+    {
+        global $wpdb;
+
+        $table = $wpdb->prefix . 'fluentform_submissions';
+        $row = $wpdb->get_row($wpdb->prepare("SELECT response FROM {$table} WHERE id = %d", (int) $insertId));
+
+        if (!$row || empty($row->response)) {
+            return;
+        }
+
+        $payload = json_decode((string) $row->response, true);
+        if (!is_array($payload)) {
+            return;
+        }
+
+        $updated = $this->mapFileValues($payload, function ($value) {
+            return $this->relocateToPrivateAndMark($value);
+        });
+
+        if (wp_json_encode($updated, JSON_UNESCAPED_UNICODE) === wp_json_encode($payload, JSON_UNESCAPED_UNICODE)) {
+            return;
+        }
+
+        $wpdb->update(
+            $table,
+            ['response' => wp_json_encode($updated, JSON_UNESCAPED_UNICODE)],
+            ['id' => (int) $insertId],
+            ['%s'],
+            ['%d']
+        );
     }
 
     public function storeFilesPrivately($insertData)
@@ -193,6 +240,13 @@ final class FF_Private_Uploads_Extension
             }
         }
 
+        if (!empty($_FILES)) {
+            $uri = isset($_SERVER['REQUEST_URI']) ? sanitize_text_field(wp_unslash($_SERVER['REQUEST_URI'])) : '';
+            if (strpos($uri, 'fluentform') !== false || strpos($uri, 'admin-ajax.php') !== false) {
+                return true;
+            }
+        }
+
         foreach ($_REQUEST as $key => $value) {
             if (is_string($key) && strpos($key, '_fluentform_') !== false) {
                 return true;
@@ -216,11 +270,20 @@ final class FF_Private_Uploads_Extension
         }
 
         $relative = $this->extractUploadRelativePath($value);
+
+        $source = $relative ? $this->sourceAbsolutePathFromRelative($relative) : '';
+
+        if ((!$source || !is_file($source)) && is_string($value)) {
+            $matched = $this->guessSourceFromBasename($value);
+            if ($matched) {
+                $source = $matched['source'];
+                $relative = $matched['relative'];
+            }
+        }
+
         if (!$relative) {
             return $value;
         }
-
-        $source = $this->sourceAbsolutePathFromRelative($relative);
         if (!$source || !is_file($source)) {
             $existingPrivate = $this->absolutePrivatePath($relative);
             if (is_file($existingPrivate)) {
@@ -248,10 +311,49 @@ final class FF_Private_Uploads_Extension
         return self::PRIVATE_SCHEME . $relative;
     }
 
+
+    private function guessSourceFromBasename($value)
+    {
+        $fileName = basename((string) $value);
+        if (!$fileName || $fileName === '.' || $fileName === '..') {
+            return [];
+        }
+
+        $upload = wp_upload_dir();
+        $base = wp_normalize_path((string) ($upload['basedir'] ?? ''));
+        if (!$base) {
+            return [];
+        }
+
+        $candidates = [
+            $base . '/fluentform/' . $fileName,
+            $base . '/fluentform/temp/' . $fileName,
+        ];
+
+        foreach ($candidates as $candidate) {
+            $candidate = wp_normalize_path($candidate);
+            if (is_file($candidate)) {
+                $relative = ltrim(str_replace($base, '', $candidate), '/');
+                $relative = $this->sanitizeRelativePath($relative);
+                if ($relative) {
+                    return [
+                        'source' => $candidate,
+                        'relative' => $relative
+                    ];
+                }
+            }
+        }
+
+        return [];
+    }
+
     private function mapFileValues(array $payload, callable $mapper)
     {
         foreach ($payload as $key => $value) {
             if (is_array($value)) {
+                if (isset($value['url']) && is_string($value['url'])) {
+                    $value['url'] = $mapper($value['url']);
+                }
                 $payload[$key] = $this->mapFileValues($value, $mapper);
                 continue;
             }
