@@ -22,6 +22,10 @@ final class FF_Private_Uploads_Admin_Only {
         add_action('init', [__CLASS__, 'ensure_private_dir']);
         add_filter('upload_dir', [__CLASS__, 'filter_upload_dir'], 50);
 
+        // Rewrite Fluent Forms tokenized URLs to our private route when rendering entry values.
+        add_filter('fluentform/response_render_input_file', [__CLASS__, 'rewrite_file_response_urls'], 9, 4);
+        add_filter('fluentform/response_render_input_image', [__CLASS__, 'rewrite_file_response_urls'], 9, 4);
+
         // Serve fake URLs (front-end route)
         add_action('template_redirect', [__CLASS__, 'maybe_serve_fake_upload']);
 
@@ -39,6 +43,54 @@ final class FF_Private_Uploads_Admin_Only {
         // Debug: see WP upload results (proves upload_dir changes worked)
         add_filter('wp_handle_upload', [__CLASS__, 'debug_wp_handle_upload'], 1, 2);
         add_filter('wp_handle_sideload', [__CLASS__, 'debug_wp_handle_upload'], 1, 2);
+    }
+
+    /**
+     * Fluent Forms stores tokenized URLs like /wp-content/uploads/fluentform/<token>.
+     * Those URLs bypass WordPress and 404 in our private-upload setup, so rewrite
+     * them to /__ff_private_uploads__/fluentform/<token> before entry rendering.
+     */
+    public static function rewrite_file_response_urls($response, $field = null, $form_id = null, $isHtml = false) {
+        // Keep full Fluent Forms callback signature to avoid PHP 8 "too many arguments" fatals.
+        return self::map_urls_recursive($response);
+    }
+
+    private static function map_urls_recursive($value) {
+        if (is_array($value)) {
+            foreach ($value as $k => $v) {
+                $value[$k] = self::map_urls_recursive($v);
+            }
+            return $value;
+        }
+
+        if (!is_string($value) || $value === '') {
+            return $value;
+        }
+
+        // Match tokenized FF upload references in both absolute and relative forms.
+        // Examples:
+        // - https://example.com/wp-content/uploads/fluentform/CQg==
+        // - /wp-content/uploads/fluentform/CQg==
+        // - fluentform/CQg==
+        if (!preg_match('#(?:https?://[^/]+)?/?wp-content/uploads/fluentform/([^/?#]+)|(?:^|/)fluentform/([^/?#]+)$#', $value, $m)) {
+            return $value;
+        }
+
+        $token = '';
+        if (!empty($m[1])) {
+            $token = $m[1];
+        } elseif (!empty($m[2])) {
+            $token = $m[2];
+        }
+
+        if (!$token) {
+            return $value;
+        }
+
+        $rewritten = home_url(self::FAKE_BASEURL_PATH . '/fluentform/' . rawurlencode($token));
+        self::log('FF PRIVATE rewrite url=' . $value . ' -> ' . $rewritten);
+
+        return $rewritten;
     }
 
     public static function ensure_private_dir() {
