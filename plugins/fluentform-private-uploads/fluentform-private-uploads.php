@@ -1,481 +1,251 @@
 <?php
 /**
- * Plugin Name: Fluent Forms Private Uploads
- * Description: Stores Fluent Forms uploads in a private directory and serves protected admin-only download links in entry details.
- * Version: 1.0.0
- * Author: Custom
+ * Plugin Name: Fluent Forms - Private Uploads (Admin-only Links)
+ * Description: Stores Fluent Forms uploads outside web root and serves them via admin-only links.
+ * Version:     1.0.0
  */
 
-if (!defined('ABSPATH')) {
-    exit;
-}
+if (!defined('ABSPATH')) exit;
 
-final class FF_Private_Uploads_Extension
-{
-    private const OPTION_PRIVATE_DIR = 'ff_private_uploads_private_dir';
-    private const DEFAULT_PRIVATE_DIR = '/home/1264996.cloudwaysapps.com/hgfynmchnh/private_html/fluentforms-uploads';
-    private const PRIVATE_SCHEME = 'ff-private://';
-    private const DOWNLOAD_ACTION = 'ff_private_fluentform_download';
+final class FF_Private_Uploads_Admin_Only {
 
-    public static function boot()
-    {
-        $instance = new self();
+    // CHANGE THIS to your desired private directory
+    const PRIVATE_BASEDIR = '/home/1264996.cloudwaysapps.com/hgfynmchnh/private_html/fluentforms-uploads';
 
-        add_action('plugins_loaded', [$instance, 'registerHooks']);
-        register_activation_hook(__FILE__, [self::class, 'activate']);
+    // A fake baseurl so nothing points to a real public URL
+    const FAKE_BASEURL_PATH = '/__ff_private_uploads__';
+
+    // Debug toggles (set false when done)
+    const DEBUG = true;
+
+    public static function boot() {
+        add_action('init', [__CLASS__, 'ensure_private_dir']);
+        add_filter('upload_dir', [__CLASS__, 'filter_upload_dir'], 50);
+
+        // Serve fake URLs (front-end route)
+        add_action('template_redirect', [__CLASS__, 'maybe_serve_fake_upload']);
+
+        // Debug: admin context + ajax action
+        add_action('admin_init', [__CLASS__, 'debug_admin_context'], 1);
+
+        // Debug: see upload ajax request keys
+        add_action('wp_ajax_fluentform_file_upload', [__CLASS__, 'debug_ff_upload_request'], 0);
+        add_action('wp_ajax_nopriv_fluentform_file_upload', [__CLASS__, 'debug_ff_upload_request'], 0);
+
+        // Debug: capture raw JSON response from upload endpoint
+        add_action('wp_ajax_fluentform_file_upload', [__CLASS__, 'tap_ff_upload_ajax'], 0);
+        add_action('wp_ajax_nopriv_fluentform_file_upload', [__CLASS__, 'tap_ff_upload_ajax'], 0);
+
+        // Debug: see WP upload results (proves upload_dir changes worked)
+        add_filter('wp_handle_upload', [__CLASS__, 'debug_wp_handle_upload'], 1, 2);
+        add_filter('wp_handle_sideload', [__CLASS__, 'debug_wp_handle_upload'], 1, 2);
     }
 
-    public static function activate()
-    {
-        if (!get_option(self::OPTION_PRIVATE_DIR)) {
-            update_option(self::OPTION_PRIVATE_DIR, self::DEFAULT_PRIVATE_DIR, false);
-        }
-
-        $privateBaseDir = self::privateBaseDir();
-        if (!is_dir($privateBaseDir)) {
-            wp_mkdir_p($privateBaseDir);
+    public static function ensure_private_dir() {
+        $base = rtrim(self::PRIVATE_BASEDIR, '/');
+        if (!is_dir($base)) {
+            wp_mkdir_p($base);
         }
     }
 
-    public function registerHooks()
-    {
-        add_filter('fluentform/insert_response_data', [$this, 'prepareFormDataFiles'], 99, 3);
-        add_filter('fluentform/filter_insert_data', [$this, 'storeFilesPrivately'], 99, 1);
-        add_filter('fluentform/response_render_input_file', [$this, 'renderProtectedFileLinks'], 20, 4);
-
-        add_action('admin_post_' . self::DOWNLOAD_ACTION, [$this, 'servePrivateFile']);
-        add_action('admin_post_nopriv_' . self::DOWNLOAD_ACTION, [$this, 'denyGuestDownload']);
-        add_filter('upload_dir', [$this, 'forcePrivateUploadDirForFluentForms'], 20, 1);
-        add_action('fluentform/submission_inserted', [$this, 'reconcileSubmissionFiles'], 20, 3);
+    private static function log($msg) {
+        if (self::DEBUG) {
+            error_log($msg);
+        }
     }
 
-
-    public function prepareFormDataFiles($formData, $formId, $inputConfigs)
-    {
-        if (!is_array($formData)) {
-            return $formData;
-        }
-
-        return $this->mapFileValues($formData, function ($value) {
-            return $this->relocateToPrivateAndMark($value);
-        });
+    /**
+     * Detect Fluent Forms upload requests.
+     * Fluent Forms uploads occur via admin-ajax.php?action=fluentform_file_upload
+     */
+    private static function is_fluentforms_upload_request(): bool {
+        if (!wp_doing_ajax()) return false;
+        $action = isset($_REQUEST['action']) ? (string) $_REQUEST['action'] : '';
+        return ($action === 'fluentform_file_upload');
     }
 
-    public function reconcileSubmissionFiles($insertId, $formData, $form)
-    {
-        global $wpdb;
-
-        $table = $wpdb->prefix . 'fluentform_submissions';
-        $row = $wpdb->get_row($wpdb->prepare("SELECT response FROM {$table} WHERE id = %d", (int) $insertId));
-
-        if (!$row || empty($row->response)) {
-            return;
-        }
-
-        $payload = json_decode((string) $row->response, true);
-        if (!is_array($payload)) {
-            return;
-        }
-
-        $updated = $this->mapFileValues($payload, function ($value) {
-            return $this->relocateToPrivateAndMark($value);
-        });
-
-        if (wp_json_encode($updated, JSON_UNESCAPED_UNICODE) === wp_json_encode($payload, JSON_UNESCAPED_UNICODE)) {
-            return;
-        }
-
-        $wpdb->update(
-            $table,
-            ['response' => wp_json_encode($updated, JSON_UNESCAPED_UNICODE)],
-            ['id' => (int) $insertId],
-            ['%s'],
-            ['%d']
-        );
-    }
-
-    public function storeFilesPrivately($insertData)
-    {
-        $payload = json_decode((string) ($insertData['response'] ?? ''), true);
-
-        if (!is_array($payload)) {
-            return $insertData;
-        }
-
-        $payload = $this->mapFileValues($payload, function ($value) {
-            return $this->relocateToPrivateAndMark($value);
-        });
-
-        $insertData['response'] = wp_json_encode($payload, JSON_UNESCAPED_UNICODE);
-
-        return $insertData;
-    }
-
-    public function renderProtectedFileLinks($response, $field, $formId, $isHtml = false)
-    {
-        if (!$response) {
-            return $response;
-        }
-
-        if (!$isHtml) {
-            return $response;
-        }
-
-        $files = is_array($response) ? $response : [$response];
-        $items = [];
-
-        foreach ($files as $fileRef) {
-            if (!$fileRef || !is_string($fileRef)) {
-                continue;
-            }
-
-            $privateRelativePath = $this->privateRelativePathFromValue($fileRef);
-            if (!$privateRelativePath) {
-                $privateRelativePath = $this->relocateToPrivateAndMark($fileRef);
-                if (strpos((string) $privateRelativePath, self::PRIVATE_SCHEME) === 0) {
-                    $privateRelativePath = substr($privateRelativePath, strlen(self::PRIVATE_SCHEME));
-                }
-            }
-
-            if (!$privateRelativePath) {
-                continue;
-            }
-
-            $downloadUrl = $this->buildProtectedDownloadUrl($privateRelativePath);
-            $items[] = sprintf(
-                '<li><a href="%1$s" target="_blank" rel="noopener noreferrer">%2$s</a></li>',
-                esc_url($downloadUrl),
-                esc_html(basename($privateRelativePath))
-            );
-        }
-
-        if (!$items) {
-            return '';
-        }
-
-        return '<ul class="ff_entry_list">' . implode('', $items) . '</ul>';
-    }
-
-    public function servePrivateFile()
-    {
-        if (!is_user_logged_in() || !current_user_can('manage_options')) {
-            wp_die(esc_html__('Unauthorized', 'ff-private-uploads'), 403);
-        }
-
-        $relative = isset($_GET['ff_file']) ? wp_unslash($_GET['ff_file']) : '';
-        $relative = $this->sanitizeRelativePath($relative);
-
-        if (!$relative) {
-            wp_die(esc_html__('Invalid file request.', 'ff-private-uploads'), 400);
-        }
-
-        if (!check_admin_referer(self::DOWNLOAD_ACTION . '|' . $relative)) {
-            wp_die(esc_html__('Invalid or expired link.', 'ff-private-uploads'), 403);
-        }
-
-        $fullPath = $this->absolutePrivatePath($relative);
-        if (!is_file($fullPath) || !is_readable($fullPath)) {
-            wp_die(esc_html__('File not found.', 'ff-private-uploads'), 404);
-        }
-
-        nocache_headers();
-
-        $mimeType = function_exists('mime_content_type') ? mime_content_type($fullPath) : 'application/octet-stream';
-        if (!$mimeType) {
-            $mimeType = 'application/octet-stream';
-        }
-
-        header('Content-Description: File Transfer');
-        header('Content-Type: ' . $mimeType);
-        header('Content-Disposition: attachment; filename="' . basename($fullPath) . '"');
-        header('Content-Length: ' . (string) filesize($fullPath));
-
-        readfile($fullPath);
-        exit;
-    }
-
-    public function denyGuestDownload()
-    {
-        wp_die(esc_html__('Unauthorized', 'ff-private-uploads'), 403);
-    }
-
-    public function forcePrivateUploadDirForFluentForms($uploads)
-    {
-        if (!$this->isFluentFormUploadRequest()) {
+    /**
+     * Force uploaded files to land in PRIVATE_BASEDIR while a FF upload request is happening.
+     */
+    public static function filter_upload_dir(array $uploads): array {
+        if (!self::is_fluentforms_upload_request()) {
             return $uploads;
         }
 
-        $privateBaseDir = self::privateBaseDir();
-        if (!is_dir($privateBaseDir)) {
-            wp_mkdir_p($privateBaseDir);
+        $privateBase = rtrim(self::PRIVATE_BASEDIR, '/');
+        $subdir      = $uploads['subdir'] ?? ''; // keep YYYY/MM
+        $targetDir   = $privateBase . $subdir;
+
+        if (!is_dir($targetDir)) {
+            wp_mkdir_p($targetDir);
         }
 
-        $subdir = isset($uploads['subdir']) ? (string) $uploads['subdir'] : '';
-        $path = wp_normalize_path(trailingslashit($privateBaseDir) . ltrim($subdir, '/'));
+        // Fake baseurl; FF will store URLs under this path
+        $fakeBaseurl = home_url(self::FAKE_BASEURL_PATH) . '/';
 
-        if (!is_dir($path)) {
-            wp_mkdir_p($path);
-        }
-
-        $uploads['basedir'] = $privateBaseDir;
-        $uploads['path'] = $path;
+        $uploads['path']    = $targetDir;
+        $uploads['basedir'] = $privateBase;
+        $uploads['url']     = $fakeBaseurl . ltrim($subdir, '/'); // keeps YYYY/MM
+        $uploads['baseurl'] = rtrim($fakeBaseurl, '/');
 
         return $uploads;
     }
 
+    /**
+     * Serve requests like:
+     *   /__ff_private_uploads__/2026/02/<filename>
+     * and also FF tokenized links:
+     *   /__ff_private_uploads__/fluentform/<shortToken>
+     *
+     * Access: admins only.
+     */
+    public static function maybe_serve_fake_upload() {
+        $prefix = self::FAKE_BASEURL_PATH . '/';
 
-    private function isFluentFormUploadRequest()
-    {
-        if (defined('DOING_AJAX') && DOING_AJAX) {
-            $action = isset($_REQUEST['action']) ? sanitize_text_field(wp_unslash($_REQUEST['action'])) : '';
-            if (strpos($action, 'fluentform') !== false) {
-                return true;
-            }
+        $uri  = isset($_SERVER['REQUEST_URI']) ? (string) $_SERVER['REQUEST_URI'] : '';
+        $path = parse_url($uri, PHP_URL_PATH);
+
+        self::log('FF PRIVATE HIT path=' . (string)$path . ' uri=' . $uri);
+
+        if (!$path || strpos($path, $prefix) !== 0) {
+            return;
         }
 
-        if (defined('REST_REQUEST') && REST_REQUEST) {
-            $uri = isset($_SERVER['REQUEST_URI']) ? sanitize_text_field(wp_unslash($_SERVER['REQUEST_URI'])) : '';
-            if (strpos($uri, '/fluentform/') !== false) {
-                return true;
-            }
+        if (!is_user_logged_in() || !current_user_can('manage_options')) {
+            status_header(403);
+            exit('Forbidden');
         }
 
-        if (!empty($_FILES)) {
-            $uri = isset($_SERVER['REQUEST_URI']) ? sanitize_text_field(wp_unslash($_SERVER['REQUEST_URI'])) : '';
-            if (strpos($uri, 'fluentform') !== false || strpos($uri, 'admin-ajax.php') !== false) {
-                return true;
-            }
-        }
+        $suffix = ltrim(substr($path, strlen($prefix)), '/');
+        $suffix = rawurldecode($suffix);
 
-        foreach ($_REQUEST as $key => $value) {
-            if (is_string($key) && strpos($key, '_fluentform_') !== false) {
-                return true;
-            }
-            if (is_string($value) && strpos($value, 'fluentform') !== false && strpos($value, 'nonce') !== false) {
-                return true;
-            }
-        }
+        // normalize base64url -> base64 (defensive)
+        $suffix = strtr($suffix, '-_', '+/');
 
-        return false;
-    }
+        $base = realpath(rtrim(self::PRIVATE_BASEDIR, '/'));
+        self::log('FF PRIVATE suffix=' . $suffix . ' base=' . (string)$base);
 
-    private function relocateToPrivateAndMark($value)
-    {
-        if (!is_string($value) || $value === '') {
-            return $value;
-        }
-
-        if (strpos($value, self::PRIVATE_SCHEME) === 0) {
-            return $value;
-        }
-
-        $relative = $this->extractUploadRelativePath($value);
-
-        $source = $relative ? $this->sourceAbsolutePathFromRelative($relative) : '';
-
-        if ((!$source || !is_file($source)) && is_string($value)) {
-            $matched = $this->guessSourceFromBasename($value);
-            if ($matched) {
-                $source = $matched['source'];
-                $relative = $matched['relative'];
-            }
-        }
-
-        if (!$relative) {
-            return $value;
-        }
-        if (!$source || !is_file($source)) {
-            $existingPrivate = $this->absolutePrivatePath($relative);
-            if (is_file($existingPrivate)) {
-                return self::PRIVATE_SCHEME . $relative;
-            }
-
-            return $value;
-        }
-
-        $destination = $this->absolutePrivatePath($relative);
-        $destinationDir = dirname($destination);
-
-        if (!is_dir($destinationDir)) {
-            wp_mkdir_p($destinationDir);
-        }
-
-        if (!@rename($source, $destination)) {
-            if (!@copy($source, $destination)) {
-                return $value;
-            }
-
-            @unlink($source);
-        }
-
-        return self::PRIVATE_SCHEME . $relative;
-    }
-
-
-    private function guessSourceFromBasename($value)
-    {
-        $fileName = basename((string) $value);
-        if (!$fileName || $fileName === '.' || $fileName === '..') {
-            return [];
-        }
-
-        $upload = wp_upload_dir();
-        $base = wp_normalize_path((string) ($upload['basedir'] ?? ''));
         if (!$base) {
-            return [];
+            status_header(500);
+            exit('Private directory missing');
         }
 
-        $candidates = [
-            $base . '/fluentform/' . $fileName,
-            $base . '/fluentform/temp/' . $fileName,
-        ];
+        // Prevent traversal
+        if (strpos($suffix, '..') !== false) {
+            status_header(400);
+            exit('Bad request');
+        }
 
-        foreach ($candidates as $candidate) {
-            $candidate = wp_normalize_path($candidate);
-            if (is_file($candidate)) {
-                $relative = ltrim(str_replace($base, '', $candidate), '/');
-                $relative = $this->sanitizeRelativePath($relative);
-                if ($relative) {
-                    return [
-                        'source' => $candidate,
-                        'relative' => $relative
-                    ];
+        // 1) Direct mapping: suffix is real relative path like "2026/02/file.jpg"
+        $candidate = $base . '/' . $suffix;
+        $real = realpath($candidate);
+
+        // 2) If FF stored "fluentform/<shortToken>", we must find the real file whose relpath ends with that token
+        if (!$real || strpos($real, $base) !== 0 || !is_file($real) || !is_readable($real)) {
+
+            $short = basename($suffix); // e.g. "Xiw=="
+
+            // Search only two levels deep (YYYY/MM), then match end segment.
+            $matches = glob($base . '/*/*/*');
+
+            if ($matches) {
+                foreach ($matches as $m) {
+                    if (!is_file($m) || !is_readable($m)) continue;
+
+                    $rel = ltrim(str_replace($base, '', $m), '/'); // "2026/02/<something...>"
+                    if (strlen($short) && substr($rel, -strlen($short)) === $short) {
+                        $real = realpath($m);
+                        self::log('FF PRIVATE endswith match short=' . $short . ' -> ' . $rel);
+                        break;
+                    }
                 }
             }
         }
 
-        return [];
-    }
+        if (!$real || strpos($real, $base) !== 0 || !is_file($real) || !is_readable($real)) {
+            status_header(404);
+            exit('Not found');
+        }
 
-    private function mapFileValues(array $payload, callable $mapper)
-    {
-        foreach ($payload as $key => $value) {
-            if (is_array($value)) {
-                if (isset($value['url']) && is_string($value['url'])) {
-                    $value['url'] = $mapper($value['url']);
-                }
-                $payload[$key] = $this->mapFileValues($value, $mapper);
-                continue;
+        if (ob_get_level()) {
+            @ob_end_clean();
+        }
+
+        header('Content-Description: File Transfer');
+        header('Content-Type: application/octet-stream');
+        header('Content-Disposition: attachment; filename="' . rawurlencode(basename($real)) . '"');
+        header('Content-Length: ' . (string) filesize($real));
+        header('X-Content-Type-Options: nosniff');
+
+        $fh = fopen($real, 'rb');
+        if ($fh) {
+            while (!feof($fh)) {
+                echo fread($fh, 1024 * 1024);
+                flush();
             }
-
-            if (!is_string($value)) {
-                continue;
-            }
-
-            $mapped = $mapper($value);
-            if (is_string($mapped)) {
-                $payload[$key] = $mapped;
-            }
+            fclose($fh);
         }
-
-        return $payload;
+        exit;
     }
 
-    private function privateRelativePathFromValue($value)
-    {
-        if (!is_string($value) || $value === '') {
-            return '';
-        }
+    /**
+     * Debug: admin page context & ajax actions
+     */
+    public static function debug_admin_context() {
+        if (!self::DEBUG) return;
+        if (!current_user_can('manage_options')) return;
 
-        if (strpos($value, self::PRIVATE_SCHEME) === 0) {
-            return $this->sanitizeRelativePath(substr($value, strlen(self::PRIVATE_SCHEME)));
-        }
+        $screen = function_exists('get_current_screen') ? get_current_screen() : null;
+        $sid = $screen ? $screen->id : '(no screen)';
+        $uri = isset($_SERVER['REQUEST_URI']) ? $_SERVER['REQUEST_URI'] : '';
+        error_log('FF ADMIN CONTEXT screen=' . $sid . ' uri=' . $uri);
 
-        return $this->extractUploadRelativePath($value);
+        if (wp_doing_ajax()) {
+            $action = isset($_REQUEST['action']) ? (string) $_REQUEST['action'] : '';
+            error_log('FF ADMIN AJAX action=' . $action);
+        }
     }
 
-    private function buildProtectedDownloadUrl($relative)
-    {
-        $base = add_query_arg(
-            [
-                'action'  => self::DOWNLOAD_ACTION,
-                'ff_file' => $relative,
-            ],
-            admin_url('admin-post.php')
-        );
-
-        return wp_nonce_url($base, self::DOWNLOAD_ACTION . '|' . $relative);
+    /**
+     * Debug: file upload ajax keys
+     */
+    public static function debug_ff_upload_request() {
+        if (!self::DEBUG) return;
+        $action = isset($_REQUEST['action']) ? (string) $_REQUEST['action'] : '';
+        $keys   = implode(',', array_keys($_REQUEST));
+        error_log('FF FILE UPLOAD AJAX HIT action=' . $action . ' keys=' . $keys);
     }
 
-    private function extractUploadRelativePath($value)
-    {
-        if (!is_string($value) || $value === '') {
-            return '';
-        }
+    /**
+     * Debug: capture the raw JSON output from the upload endpoint.
+     * Must not change output.
+     */
+    public static function tap_ff_upload_ajax() {
+        if (!self::DEBUG) return;
 
-        $upload = wp_upload_dir();
-        $baseUrl = (string) ($upload['baseurl'] ?? '');
+        // avoid stacking multiple buffers if this action fires twice for any reason
+        static $started = false;
+        if ($started) return;
+        $started = true;
 
-        if ($baseUrl && strpos($value, $baseUrl) === 0) {
-            $relative = ltrim(substr($value, strlen($baseUrl)), '/');
-            return $this->sanitizeRelativePath($relative);
-        }
-
-        $path = wp_parse_url($value, PHP_URL_PATH);
-        if (!$path) {
-            return '';
-        }
-
-        $path = wp_normalize_path((string) $path);
-        $marker = '/fluentform/';
-        $pos = strpos($path, $marker);
-
-        if ($pos === false) {
-            return '';
-        }
-
-        $relative = ltrim(substr($path, $pos + 1), '/');
-
-        return $this->sanitizeRelativePath($relative);
+        ob_start(function ($buffer) {
+            error_log('FF UPLOAD RAW RESPONSE: ' . $buffer);
+            return $buffer;
+        });
     }
 
-    private function sourceAbsolutePathFromRelative($relative)
-    {
-        $relative = $this->sanitizeRelativePath($relative);
+    /**
+     * Debug: confirm WP upload handler sees the private path + fake url
+     */
+    public static function debug_wp_handle_upload($upload, $context) {
+        if (!self::DEBUG) return $upload;
 
-        if (!$relative) {
-            return '';
-        }
+        $file = isset($upload['file']) ? $upload['file'] : '';
+        $url  = isset($upload['url']) ? $upload['url'] : '';
+        error_log('FF UPLOAD DEBUG hook=' . current_filter() . ' file=' . $file . ' url=' . $url);
 
-        $upload = wp_upload_dir();
-        $basedir = (string) ($upload['basedir'] ?? '');
-
-        if (!$basedir) {
-            return '';
-        }
-
-        return wp_normalize_path(trailingslashit($basedir) . $relative);
-    }
-
-    private function absolutePrivatePath($relative)
-    {
-        $relative = $this->sanitizeRelativePath($relative);
-        return wp_normalize_path(trailingslashit(self::privateBaseDir()) . $relative);
-    }
-
-    private function sanitizeRelativePath($relative)
-    {
-        $relative = wp_normalize_path((string) $relative);
-        $relative = ltrim($relative, '/');
-
-        if ($relative === '' || strpos($relative, '..') !== false) {
-            return '';
-        }
-
-        return $relative;
-    }
-
-    private static function privateBaseDir()
-    {
-        $configured = (string) get_option(self::OPTION_PRIVATE_DIR, self::DEFAULT_PRIVATE_DIR);
-        $configured = trim($configured);
-
-        if ($configured === '') {
-            $configured = self::DEFAULT_PRIVATE_DIR;
-        }
-
-        return wp_normalize_path($configured);
+        return $upload;
     }
 }
 
-FF_Private_Uploads_Extension::boot();
+FF_Private_Uploads_Admin_Only::boot();
