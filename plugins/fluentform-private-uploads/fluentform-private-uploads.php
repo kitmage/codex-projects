@@ -43,6 +43,70 @@ final class FF_Private_Uploads_Admin_Only {
         // Debug: see WP upload results (proves upload_dir changes worked)
         add_filter('wp_handle_upload', [__CLASS__, 'debug_wp_handle_upload'], 1, 2);
         add_filter('wp_handle_sideload', [__CLASS__, 'debug_wp_handle_upload'], 1, 2);
+
+        // Debug: catch fatal runtime errors to identify null Entry responses.
+        add_action('shutdown', [__CLASS__, 'debug_fatal_error'], 9999);
+    }
+
+    /**
+     * Fluent Forms stores tokenized URLs like /wp-content/uploads/fluentform/<token>.
+     * Those URLs bypass WordPress and 404 in our private-upload setup, so rewrite
+     * them to /__ff_private_uploads__/fluentform/<token> before entry rendering.
+     */
+    public static function rewrite_file_response_urls($response, $field = null, $form_id = null, $isHtml = false) {
+        // Keep full Fluent Forms callback signature to avoid PHP 8 "too many arguments" fatals.
+        // Also avoid touching non-HTML contexts to keep parser behavior unchanged.
+        if (!$isHtml) {
+            return $response;
+        }
+
+        $fieldName = is_array($field) && isset($field['attributes']['name']) ? $field['attributes']['name'] : '(unknown)';
+        self::log('FF PRIVATE render hook=' . current_filter() . ' form=' . (string)$form_id . ' field=' . $fieldName . ' html=' . ($isHtml ? '1' : '0') . ' type=' . gettype($response));
+
+        try {
+            return self::map_urls_recursive($response);
+        } catch (\Throwable $e) {
+            self::log('FF PRIVATE rewrite ERROR: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
+            return $response;
+        }
+    }
+
+    private static function map_urls_recursive($value) {
+        if (is_array($value)) {
+            foreach ($value as $k => $v) {
+                $value[$k] = self::map_urls_recursive($v);
+            }
+            return $value;
+        }
+
+        if (!is_string($value) || $value === '') {
+            return $value;
+        }
+
+        // Match tokenized FF upload references in both absolute and relative forms.
+        // Examples:
+        // - https://example.com/wp-content/uploads/fluentform/CQg==
+        // - /wp-content/uploads/fluentform/CQg==
+        // - fluentform/CQg==
+        if (!preg_match('#(?:https?://[^/]+)?/?wp-content/uploads/fluentform/([^/?#]+)|(?:^|/)fluentform/([^/?#]+)$#', $value, $m)) {
+            return $value;
+        }
+
+        $token = '';
+        if (!empty($m[1])) {
+            $token = $m[1];
+        } elseif (!empty($m[2])) {
+            $token = $m[2];
+        }
+
+        if (!$token) {
+            return $value;
+        }
+
+        $rewritten = home_url(self::FAKE_BASEURL_PATH . '/fluentform/' . rawurlencode($token));
+        self::log('FF PRIVATE rewrite url=' . $value . ' -> ' . $rewritten);
+
+        return $rewritten;
     }
 
     /**
@@ -103,6 +167,22 @@ final class FF_Private_Uploads_Admin_Only {
         if (self::DEBUG) {
             error_log($msg);
         }
+    }
+
+
+    public static function debug_fatal_error() {
+        if (!self::DEBUG) return;
+
+        $error = error_get_last();
+        if (!$error) return;
+
+        $fatalTypes = [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR, E_RECOVERABLE_ERROR];
+        if (!in_array($error['type'], $fatalTypes, true)) {
+            return;
+        }
+
+        $uri = isset($_SERVER['REQUEST_URI']) ? (string)$_SERVER['REQUEST_URI'] : '';
+        self::log('FF PRIVATE FATAL type=' . $error['type'] . ' msg=' . $error['message'] . ' file=' . $error['file'] . ':' . $error['line'] . ' uri=' . $uri);
     }
 
     /**
