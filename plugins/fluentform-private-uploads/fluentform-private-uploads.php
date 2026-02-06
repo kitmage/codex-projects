@@ -2,10 +2,16 @@
 /**
  * Plugin Name: Fluent Forms - Private Uploads (Admin-only Links)
  * Description: Stores Fluent Forms uploads outside web root and serves them via admin-only links.
- * Version:     1.0.0
+ * Version:     1.0.1
  */
 
-if (!defined('ABSPATH')) exit;
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+if (class_exists('FF_Private_Uploads_Admin_Only', false)) {
+    return;
+}
 
 final class FF_Private_Uploads_Admin_Only {
 
@@ -22,23 +28,66 @@ final class FF_Private_Uploads_Admin_Only {
         add_action('init', [__CLASS__, 'ensure_private_dir']);
         add_filter('upload_dir', [__CLASS__, 'filter_upload_dir'], 50);
 
+        // Rewrite Fluent Forms tokenized URLs to our private route when rendering entry values.
+        add_filter('fluentform/response_render_input_file', [__CLASS__, 'rewrite_file_response_urls'], 9, 4);
+        add_filter('fluentform/response_render_input_image', [__CLASS__, 'rewrite_file_response_urls'], 9, 4);
+
         // Serve fake URLs (front-end route)
         add_action('template_redirect', [__CLASS__, 'maybe_serve_fake_upload']);
 
-        // Debug: admin context + ajax action
+        // Debug hooks
         add_action('admin_init', [__CLASS__, 'debug_admin_context'], 1);
-
-        // Debug: see upload ajax request keys
         add_action('wp_ajax_fluentform_file_upload', [__CLASS__, 'debug_ff_upload_request'], 0);
         add_action('wp_ajax_nopriv_fluentform_file_upload', [__CLASS__, 'debug_ff_upload_request'], 0);
-
-        // Debug: capture raw JSON response from upload endpoint
         add_action('wp_ajax_fluentform_file_upload', [__CLASS__, 'tap_ff_upload_ajax'], 0);
         add_action('wp_ajax_nopriv_fluentform_file_upload', [__CLASS__, 'tap_ff_upload_ajax'], 0);
-
-        // Debug: see WP upload results (proves upload_dir changes worked)
         add_filter('wp_handle_upload', [__CLASS__, 'debug_wp_handle_upload'], 1, 2);
         add_filter('wp_handle_sideload', [__CLASS__, 'debug_wp_handle_upload'], 1, 2);
+        add_action('shutdown', [__CLASS__, 'debug_fatal_error'], 9999);
+    }
+
+    /**
+     * Fluent Forms stores tokenized URLs like /wp-content/uploads/fluentform/<token>.
+     * Rewrite them to /__ff_private_uploads__/fluentform/<token> only for HTML rendering.
+     */
+    public static function rewrite_file_response_urls($response, $field = null, $form_id = null, $isHtml = false) {
+        if (!$isHtml) {
+            return $response;
+        }
+
+        try {
+            return self::map_urls_recursive($response);
+        } catch (\Throwable $e) {
+            self::log('FF PRIVATE rewrite ERROR: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
+            return $response;
+        }
+    }
+
+    private static function map_urls_recursive($value) {
+        if (is_array($value)) {
+            foreach ($value as $k => $v) {
+                $value[$k] = self::map_urls_recursive($v);
+            }
+            return $value;
+        }
+
+        if (!is_string($value) || $value === '') {
+            return $value;
+        }
+
+        if (!preg_match('#(?:https?://[^/]+)?/?wp-content/uploads/fluentform/([^/?#]+)|(?:^|/)fluentform/([^/?#]+)$#', $value, $m)) {
+            return $value;
+        }
+
+        $token = !empty($m[1]) ? $m[1] : (!empty($m[2]) ? $m[2] : '');
+        if (!$token) {
+            return $value;
+        }
+
+        $rewritten = home_url(self::FAKE_BASEURL_PATH . '/fluentform/' . rawurlencode($token));
+        self::log('FF PRIVATE rewrite url=' . $value . ' -> ' . $rewritten);
+
+        return $rewritten;
     }
 
     public static function ensure_private_dir() {
@@ -54,14 +103,56 @@ final class FF_Private_Uploads_Admin_Only {
         }
     }
 
+    public static function debug_fatal_error() {
+        if (!self::DEBUG) return;
+
+        $error = error_get_last();
+        if (!$error) return;
+
+        $fatalTypes = [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR, E_RECOVERABLE_ERROR];
+        if (!in_array($error['type'], $fatalTypes, true)) {
+            return;
+        }
+
+        $uri = isset($_SERVER['REQUEST_URI']) ? (string)$_SERVER['REQUEST_URI'] : '';
+        self::log('FF PRIVATE FATAL type=' . $error['type'] . ' msg=' . $error['message'] . ' file=' . $error['file'] . ':' . $error['line'] . ' uri=' . $uri);
+    }
+
     /**
      * Detect Fluent Forms upload requests.
-     * Fluent Forms uploads occur via admin-ajax.php?action=fluentform_file_upload
      */
     private static function is_fluentforms_upload_request(): bool {
-        if (!wp_doing_ajax()) return false;
+        $hasFiles = !empty($_FILES);
         $action = isset($_REQUEST['action']) ? (string) $_REQUEST['action'] : '';
-        return ($action === 'fluentform_file_upload');
+        $uri = isset($_SERVER['REQUEST_URI']) ? (string) $_SERVER['REQUEST_URI'] : '';
+        self::log('FF PRIVATE upload detect start action=' . $action . ' files=' . ($hasFiles ? '1' : '0') . ' uri=' . $uri);
+
+        // Canonical Fluent Forms AJAX upload endpoint.
+        if (wp_doing_ajax() && $action === 'fluentform_file_upload') {
+            self::log('FF PRIVATE upload detect match=ajax_canonical');
+            return true;
+        }
+
+        // Fallback: Fluent Forms variations can use different upload/submit actions.
+        if (wp_doing_ajax() && $action && preg_match('/^fluentform.*(upload|submit)/i', $action)) {
+            self::log('FF PRIVATE upload detect match=ajax_fallback action=' . $action . ' files=' . ($hasFiles ? '1' : '0'));
+            return true;
+        }
+
+        // Defensive fallback for non-ajax handlers that still carry FF form payload + files.
+        $hasFluentFormMarker = isset($_REQUEST['fluent_forms_form_id'])
+            || isset($_REQUEST['_fluentform'])
+            || isset($_REQUEST['_fluentform_nonce'])
+            || isset($_REQUEST['_wp_http_referer']) && strpos((string) $_REQUEST['_wp_http_referer'], 'fluentform') !== false
+            || strpos($uri, 'fluentform') !== false;
+
+        if ($hasFiles && $hasFluentFormMarker) {
+            self::log('FF PRIVATE upload detect match=marker files=1 action=' . $action . ' uri=' . $uri);
+            return true;
+        }
+
+        self::log('FF PRIVATE upload detect miss action=' . $action . ' files=' . ($hasFiles ? '1' : '0'));
+        return false;
     }
 
     /**
@@ -80,24 +171,25 @@ final class FF_Private_Uploads_Admin_Only {
             wp_mkdir_p($targetDir);
         }
 
-        // Fake baseurl; FF will store URLs under this path
         $fakeBaseurl = home_url(self::FAKE_BASEURL_PATH) . '/';
 
         $uploads['path']    = $targetDir;
         $uploads['basedir'] = $privateBase;
-        $uploads['url']     = $fakeBaseurl . ltrim($subdir, '/'); // keeps YYYY/MM
+        $uploads['url']     = $fakeBaseurl . ltrim($subdir, '/');
         $uploads['baseurl'] = rtrim($fakeBaseurl, '/');
+
+        self::log(
+            'FF PRIVATE upload_dir override basedir=' . $privateBase
+            . ' subdir=' . $subdir
+            . ' path=' . $uploads['path']
+            . ' url=' . $uploads['url']
+        );
 
         return $uploads;
     }
 
     /**
-     * Serve requests like:
-     *   /__ff_private_uploads__/2026/02/<filename>
-     * and also FF tokenized links:
-     *   /__ff_private_uploads__/fluentform/<shortToken>
-     *
-     * Access: admins only.
+     * Serve requests for direct relative paths and tokenized links.
      */
     public static function maybe_serve_fake_upload() {
         $prefix = self::FAKE_BASEURL_PATH . '/';
@@ -118,8 +210,6 @@ final class FF_Private_Uploads_Admin_Only {
 
         $suffix = ltrim(substr($path, strlen($prefix)), '/');
         $suffix = rawurldecode($suffix);
-
-        // normalize base64url -> base64 (defensive)
         $suffix = strtr($suffix, '-_', '+/');
 
         $base = realpath(rtrim(self::PRIVATE_BASEDIR, '/'));
@@ -130,29 +220,25 @@ final class FF_Private_Uploads_Admin_Only {
             exit('Private directory missing');
         }
 
-        // Prevent traversal
         if (strpos($suffix, '..') !== false) {
             status_header(400);
             exit('Bad request');
         }
 
-        // 1) Direct mapping: suffix is real relative path like "2026/02/file.jpg"
         $candidate = $base . '/' . $suffix;
         $real = realpath($candidate);
 
-        // 2) If FF stored "fluentform/<shortToken>", we must find the real file whose relpath ends with that token
         if (!$real || strpos($real, $base) !== 0 || !is_file($real) || !is_readable($real)) {
-
-            $short = basename($suffix); // e.g. "Xiw=="
-
-            // Search only two levels deep (YYYY/MM), then match end segment.
+            $short = basename($suffix);
             $matches = glob($base . '/*/*/*');
 
             if ($matches) {
                 foreach ($matches as $m) {
-                    if (!is_file($m) || !is_readable($m)) continue;
+                    if (!is_file($m) || !is_readable($m)) {
+                        continue;
+                    }
 
-                    $rel = ltrim(str_replace($base, '', $m), '/'); // "2026/02/<something...>"
+                    $rel = ltrim(str_replace($base, '', $m), '/');
                     if (strlen($short) && substr($rel, -strlen($short)) === $short) {
                         $real = realpath($m);
                         self::log('FF PRIVATE endswith match short=' . $short . ' -> ' . $rel);
@@ -188,9 +274,6 @@ final class FF_Private_Uploads_Admin_Only {
         exit;
     }
 
-    /**
-     * Debug: admin page context & ajax actions
-     */
     public static function debug_admin_context() {
         if (!self::DEBUG) return;
         if (!current_user_can('manage_options')) return;
@@ -206,9 +289,6 @@ final class FF_Private_Uploads_Admin_Only {
         }
     }
 
-    /**
-     * Debug: file upload ajax keys
-     */
     public static function debug_ff_upload_request() {
         if (!self::DEBUG) return;
         $action = isset($_REQUEST['action']) ? (string) $_REQUEST['action'] : '';
@@ -216,14 +296,9 @@ final class FF_Private_Uploads_Admin_Only {
         error_log('FF FILE UPLOAD AJAX HIT action=' . $action . ' keys=' . $keys);
     }
 
-    /**
-     * Debug: capture the raw JSON output from the upload endpoint.
-     * Must not change output.
-     */
     public static function tap_ff_upload_ajax() {
         if (!self::DEBUG) return;
 
-        // avoid stacking multiple buffers if this action fires twice for any reason
         static $started = false;
         if ($started) return;
         $started = true;
@@ -234,9 +309,6 @@ final class FF_Private_Uploads_Admin_Only {
         });
     }
 
-    /**
-     * Debug: confirm WP upload handler sees the private path + fake url
-     */
     public static function debug_wp_handle_upload($upload, $context) {
         if (!self::DEBUG) return $upload;
 
