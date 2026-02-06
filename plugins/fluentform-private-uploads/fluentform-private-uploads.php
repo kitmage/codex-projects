@@ -122,9 +122,34 @@ final class FF_Private_Uploads_Admin_Only {
      * Detect Fluent Forms upload requests.
      */
     private static function is_fluentforms_upload_request(): bool {
-        if (!wp_doing_ajax()) return false;
+        $hasFiles = !empty($_FILES);
         $action = isset($_REQUEST['action']) ? (string) $_REQUEST['action'] : '';
-        return ($action === 'fluentform_file_upload');
+        $uri = isset($_SERVER['REQUEST_URI']) ? (string) $_SERVER['REQUEST_URI'] : '';
+
+        // Canonical Fluent Forms AJAX upload endpoint.
+        if (wp_doing_ajax() && $action === 'fluentform_file_upload') {
+            return true;
+        }
+
+        // Fallback: Fluent Forms variations can use different upload/submit actions.
+        if (wp_doing_ajax() && $action && preg_match('/^fluentform.*(upload|submit)/i', $action)) {
+            self::log('FF PRIVATE upload detect fallback action=' . $action . ' files=' . ($hasFiles ? '1' : '0'));
+            return true;
+        }
+
+        // Defensive fallback for non-ajax handlers that still carry FF form payload + files.
+        $hasFluentFormMarker = isset($_REQUEST['fluent_forms_form_id'])
+            || isset($_REQUEST['_fluentform'])
+            || isset($_REQUEST['_fluentform_nonce'])
+            || isset($_REQUEST['_wp_http_referer']) && strpos((string) $_REQUEST['_wp_http_referer'], 'fluentform') !== false
+            || strpos($uri, 'fluentform') !== false;
+
+        if ($hasFiles && $hasFluentFormMarker) {
+            self::log('FF PRIVATE upload detect marker files=1 action=' . $action . ' uri=' . $uri);
+            return true;
+        }
+
+        return false;
     }
 
     /**
