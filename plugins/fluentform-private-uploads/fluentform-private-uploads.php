@@ -125,15 +125,17 @@ final class FF_Private_Uploads_Admin_Only {
         $hasFiles = !empty($_FILES);
         $action = isset($_REQUEST['action']) ? (string) $_REQUEST['action'] : '';
         $uri = isset($_SERVER['REQUEST_URI']) ? (string) $_SERVER['REQUEST_URI'] : '';
+        self::log('FF PRIVATE upload detect start action=' . $action . ' files=' . ($hasFiles ? '1' : '0') . ' uri=' . $uri);
 
         // Canonical Fluent Forms AJAX upload endpoint.
         if (wp_doing_ajax() && $action === 'fluentform_file_upload') {
+            self::log('FF PRIVATE upload detect match=ajax_canonical');
             return true;
         }
 
         // Fallback: Fluent Forms variations can use different upload/submit actions.
         if (wp_doing_ajax() && $action && preg_match('/^fluentform.*(upload|submit)/i', $action)) {
-            self::log('FF PRIVATE upload detect fallback action=' . $action . ' files=' . ($hasFiles ? '1' : '0'));
+            self::log('FF PRIVATE upload detect match=ajax_fallback action=' . $action . ' files=' . ($hasFiles ? '1' : '0'));
             return true;
         }
 
@@ -145,10 +147,11 @@ final class FF_Private_Uploads_Admin_Only {
             || strpos($uri, 'fluentform') !== false;
 
         if ($hasFiles && $hasFluentFormMarker) {
-            self::log('FF PRIVATE upload detect marker files=1 action=' . $action . ' uri=' . $uri);
+            self::log('FF PRIVATE upload detect match=marker files=1 action=' . $action . ' uri=' . $uri);
             return true;
         }
 
+        self::log('FF PRIVATE upload detect miss action=' . $action . ' files=' . ($hasFiles ? '1' : '0'));
         return false;
     }
 
@@ -174,6 +177,13 @@ final class FF_Private_Uploads_Admin_Only {
         $uploads['basedir'] = $privateBase;
         $uploads['url']     = $fakeBaseurl . ltrim($subdir, '/');
         $uploads['baseurl'] = rtrim($fakeBaseurl, '/');
+
+        self::log(
+            'FF PRIVATE upload_dir override basedir=' . $privateBase
+            . ' subdir=' . $subdir
+            . ' path=' . $uploads['path']
+            . ' url=' . $uploads['url']
+        );
 
         return $uploads;
     }
